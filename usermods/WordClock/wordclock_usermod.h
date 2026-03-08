@@ -4,13 +4,35 @@
 /*
  * WLED Word Clock Usermod
  * ========================
- * Displays the current time as words on an 11×10 LED matrix.
+ * Renders the current time as words on an 11×10 LED matrix,
+ * overlaid on top of whatever WLED effect is currently running.
  *
- * Physical layout:
- *   LEDs 0–3   : Minute indicator dots (one lights per extra minute within 5-min block)
- *   LEDs 4–113 : 11×10 matrix in serpentine order (even rows L→R, odd rows R→L)
+ * Rendering model
+ * ───────────────
+ * The standard usermod loop() runs BEFORE the WLED effect engine
+ * each frame, so any pixels written there get overwritten.
+ * This usermod uses handleOverlayDraw() instead — a virtual
+ * method called by WLED AFTER the effect renders but BEFORE
+ * show() sends the frame to the LEDs.
  *
- * Stencil layout (Row × Col, 0-indexed):
+ *   • Background pixels : scale down the effect color by bgBrightness
+ *                         0   = background fully black
+ *                         128 = half-brightness effect
+ *                         255 = effect shown at full brightness (unchanged)
+ *   • Word pixels       : overwrite with solid wordColor at wordBrightness
+ *   • Minute dots       : same solid color as words, or off
+ *
+ * On each minute change, old words crossfade out and new words
+ * crossfade in over transitionMs milliseconds.
+ *
+ * Physical layout
+ * ───────────────
+ *   LEDs 0–3   : Minute indicator dots (one lights per extra minute mod-5)
+ *   LEDs 4–113 : 11×10 matrix, serpentine wiring
+ *                Even rows 0,2,4… run left→right
+ *                Odd  rows 1,3,5… run right→left
+ *
+ * Stencil
  *   Row 0: I  T  L  I  S  A  S  A  M  P  M
  *   Row 1: A  C  Q  U  A  R  T  E  R  D  C
  *   Row 2: T  W  E  N  T  Y  F  I  V  E  X
@@ -20,472 +42,364 @@
  *   Row 6: F  O  U  R  F  I  V  E  T  W  O
  *   Row 7: E  I  G  H  T  E  L  E  V  E  N
  *   Row 8: S  E  V  E  N  T  W  E  L  V  E
- *   Row 9: T  E  N  S  Z  O  C  L  O  C  K  (O = "O'" on stencil)
+ *   Row 9: T  E  N  S  Z  O  C  L  O  C  K
  *
- * Home Assistant integration: via WLED's built-in HTTP + MQTT APIs
- *   Usermod settings accessible at: GET/POST http://<wled-ip>/json/cfg  (key: "wc")
- *   Runtime state accessible at:    GET/POST http://<wled-ip>/json/state (key: "wc")
+ * Home Assistant: POST to http://<ip>/json/state with {"wc":{...}}
  */
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Word segment descriptors
+// Word segment descriptors — row, start-column, length
 // ──────────────────────────────────────────────────────────────────────────────
-struct WordSegment {
-  uint8_t row;
-  uint8_t col;
-  uint8_t len;
-};
+struct WC_Seg { uint8_t row, col, len; };
 
-// All addressable word positions
 // clang-format off
-static constexpr WordSegment WC_IT        = {0,  0, 2};
-static constexpr WordSegment WC_IS        = {0,  3, 2};
-static constexpr WordSegment WC_AM        = {0,  7, 2};
-static constexpr WordSegment WC_PM        = {0,  9, 2};
-static constexpr WordSegment WC_QUARTER   = {1,  2, 7};
-static constexpr WordSegment WC_TWENTY    = {2,  0, 6};
-static constexpr WordSegment WC_FIVE_MIN  = {2,  6, 4};   // FIVE (minutes)
-static constexpr WordSegment WC_HALF      = {3,  0, 4};
-static constexpr WordSegment WC_TEN_MIN   = {3,  5, 3};   // TEN  (minutes)
-static constexpr WordSegment WC_TO        = {3,  9, 2};
-static constexpr WordSegment WC_PAST      = {4,  0, 4};
-static constexpr WordSegment WC_NINE      = {4,  7, 4};
-static constexpr WordSegment WC_ONE       = {5,  0, 3};
-static constexpr WordSegment WC_SIX       = {5,  3, 3};
-static constexpr WordSegment WC_THREE     = {5,  6, 5};
-static constexpr WordSegment WC_FOUR      = {6,  0, 4};
-static constexpr WordSegment WC_FIVE_HR   = {6,  4, 4};   // FIVE (hours)
-static constexpr WordSegment WC_TWO       = {6,  8, 3};
-static constexpr WordSegment WC_EIGHT     = {7,  0, 5};
-static constexpr WordSegment WC_ELEVEN    = {7,  5, 6};
-static constexpr WordSegment WC_SEVEN     = {8,  0, 5};
-static constexpr WordSegment WC_TWELVE    = {8,  5, 6};
-static constexpr WordSegment WC_TEN_HR    = {9,  0, 3};   // TEN  (hours)
-static constexpr WordSegment WC_OCLOCK    = {9,  5, 6};   // O'CLOCK (cols 5-10)
+static constexpr WC_Seg WC_IT       = {0,  0, 2};  // IT
+static constexpr WC_Seg WC_IS       = {0,  3, 2};  // IS
+static constexpr WC_Seg WC_AM       = {0,  7, 2};  // AM
+static constexpr WC_Seg WC_PM       = {0,  9, 2};  // PM
+static constexpr WC_Seg WC_QUARTER  = {1,  2, 7};  // QUARTER
+static constexpr WC_Seg WC_TWENTY   = {2,  0, 6};  // TWENTY
+static constexpr WC_Seg WC_FIVE_MIN = {2,  6, 4};  // FIVE  (minutes)
+static constexpr WC_Seg WC_HALF     = {3,  0, 4};  // HALF
+static constexpr WC_Seg WC_TEN_MIN  = {3,  5, 3};  // TEN   (minutes)
+static constexpr WC_Seg WC_TO       = {3,  9, 2};  // TO
+static constexpr WC_Seg WC_PAST     = {4,  0, 4};  // PAST
+static constexpr WC_Seg WC_NINE     = {4,  7, 4};  // NINE
+static constexpr WC_Seg WC_ONE      = {5,  0, 3};  // ONE
+static constexpr WC_Seg WC_SIX      = {5,  3, 3};  // SIX
+static constexpr WC_Seg WC_THREE    = {5,  6, 5};  // THREE
+static constexpr WC_Seg WC_FOUR     = {6,  0, 4};  // FOUR
+static constexpr WC_Seg WC_FIVE_HR  = {6,  4, 4};  // FIVE  (hours)
+static constexpr WC_Seg WC_TWO      = {6,  8, 3};  // TWO
+static constexpr WC_Seg WC_EIGHT    = {7,  0, 5};  // EIGHT
+static constexpr WC_Seg WC_ELEVEN   = {7,  5, 6};  // ELEVEN
+static constexpr WC_Seg WC_SEVEN    = {8,  0, 5};  // SEVEN
+static constexpr WC_Seg WC_TWELVE   = {8,  5, 6};  // TWELVE
+static constexpr WC_Seg WC_TEN_HR   = {9,  0, 3};  // TEN   (hours)
+static constexpr WC_Seg WC_OCLOCK   = {9,  5, 6};  // O'CLOCK
 // clang-format on
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Transition modes
-// ──────────────────────────────────────────────────────────────────────────────
-#define TRANS_RAINBOW_WAVE  0
-#define TRANS_RADIAL_BLOOM  1
-#define TRANS_CORNER_WIPE   2
-#define TRANS_RANDOM        3
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Main usermod class
+// Usermod class
 // ──────────────────────────────────────────────────────────────────────────────
 class WordClockUsermod : public Usermod {
 public:
   static const char _name[];
 
 private:
-  // ── Matrix geometry ──────────────────────────────────────────────────────
-  static const int COLS          = 11;
-  static const int ROWS          = 10;
-  static const int MINUTE_LEDS   = 4;
-  static const int MATRIX_LEDS   = ROWS * COLS;          // 110
-  static const int TOTAL_LEDS    = MINUTE_LEDS + MATRIX_LEDS; // 114
+  // ── Matrix geometry constants ──────────────────────────────────────────────
+  static const int COLS        = 11;
+  static const int ROWS        = 10;
+  static const int MINUTE_LEDS = 4;
+  static const int MATRIX_LEDS = ROWS * COLS;                 // 110
+  static const int TOTAL_LEDS  = MINUTE_LEDS + MATRIX_LEDS;  // 114
 
-  // ── Configurable settings (saved to flash) ────────────────────────────────
-  bool    enabled            = true;
-  uint8_t wordBrightness     = 255;   // 0-255
-  uint8_t bgBrightness       = 20;    // 0-255 background glow
-  bool    showAmPm           = true;
-  bool    randomWordColor    = false;
-  bool    randomBgColor      = false;
-  uint8_t transitionMode     = TRANS_RANDOM;  // 0-3
-  uint16_t transitionMs      = 1200;          // transition duration ms
-  // Word color
-  uint8_t wordR = 255, wordG = 200, wordB = 100;
-  // Background color
-  uint8_t bgR   =   0, bgG   =   0, bgB   =  30;
+  // ── Configurable settings (persisted to flash) ────────────────────────────
+  bool     enabled         = true;
+  uint8_t  wordBrightness  = 255;  // 0-255: brightness of word pixels
+  uint8_t  bgBrightness    = 40;   // 0-255: scale applied to the effect pixels
+                                   //   0   → background black
+                                   //   128 → background at half effect brightness
+                                   //   255 → background unchanged (full effect)
+  bool     showAmPm        = true;
+  bool     randomWordColor = false; // pick a new random word color each minute
+  uint16_t transitionMs    = 800;  // crossfade duration on minute rollover (ms)
+  uint8_t  wordR = 255, wordG = 200, wordB = 100; // warm-white default
 
   // ── Runtime state ─────────────────────────────────────────────────────────
-  uint8_t  lastMinute        = 255;
-  bool     firstRun          = true;   // true until we've shown the time once
-  bool     transitionActive  = false;
-  uint32_t transitionStart   = 0;
-  uint8_t  activeTransMode   = 0;
+  uint8_t  lastMinute  = 255;
+  bool     firstRun    = true;
 
-  // Buffered LED state for current time (set once per minute)
-  uint32_t targetColors[TOTAL_LEDS]; // WRGB packed colors for target display
+  // Word pixel masks — true means "this LED index is a lit word pixel"
+  bool wordPixels[TOTAL_LEDS];     // current target mask
+  bool prevWordPixels[TOTAL_LEDS]; // previous mask (used during crossfade)
 
-  // ── LED index helpers ─────────────────────────────────────────────────────
+  uint8_t  minuteDots = 0;         // how many minute-dot LEDs to light (0-4)
 
-  /** Physical LED index for a matrix cell (row, col), accounting for serpentine wiring. */
+  // Crossfade state
+  bool     fadingIn  = false;
+  uint32_t fadeStart = 0;
+
+  // Resolved word color (updated each minute, or on settings change)
+  uint32_t resolvedWordColor = 0;
+
+  // ── Low-level helpers ─────────────────────────────────────────────────────
+
+  /** Physical LED index for matrix cell (row, col), accounting for serpentine wiring. */
   inline int matrixLed(int row, int col) const {
     int base = MINUTE_LEDS + row * COLS;
     return (row % 2 == 0) ? base + col : base + (COLS - 1 - col);
   }
 
-  /** Pack R,G,B,W into WLED's RGBW uint32 format. */
-  static inline uint32_t packColor(uint8_t r, uint8_t g, uint8_t b, uint8_t w = 0) {
-    return (uint32_t(w) << 24) | (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);
+  static inline uint32_t packRGB(uint8_t r, uint8_t g, uint8_t b) {
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
   }
 
-  /** Scale a packed color by brightness (0-255). */
-  static inline uint32_t scaleBrightness(uint32_t c, uint8_t bri) {
+  /**
+   * Scale all channels of a packed WRGB color by bri/255.
+   * Handles both RGB and RGBW strip types.
+   */
+  static inline uint32_t scaleBri(uint32_t c, uint8_t bri) {
     if (bri == 255) return c;
+    if (bri == 0)   return 0;
     uint8_t r = ((c >> 16) & 0xFF) * bri / 255;
     uint8_t g = ((c >>  8) & 0xFF) * bri / 255;
     uint8_t b = ((c      ) & 0xFF) * bri / 255;
     uint8_t w = ((c >> 24) & 0xFF) * bri / 255;
-    return packColor(r, g, b, w);
+    return ((uint32_t)w << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
   }
 
-  // ── Color generators ──────────────────────────────────────────────────────
-
-  /** Generate a random vibrant RGB color. */
-  static uint32_t randomColor() {
-    // Keep colors vivid: one channel full, one medium, one low-ish
-    uint8_t r = random8();
-    uint8_t g = random8();
-    uint8_t b = random8();
-    // Boost saturation
+  /** Generate a vibrant random color (one channel always at 255). */
+  static uint32_t vibrantRandom() {
+    uint8_t r = random8(), g = random8(), b = random8();
     uint8_t mx = max(r, max(g, b));
     if (mx > 0) {
-      r = (uint8_t)((uint16_t)r * 255 / mx);
-      g = (uint8_t)((uint16_t)g * 255 / mx);
-      b = (uint8_t)((uint16_t)b * 255 / mx);
+      r = (uint16_t)r * 255 / mx;
+      g = (uint16_t)g * 255 / mx;
+      b = (uint16_t)b * 255 / mx;
     }
-    return packColor(r, g, b);
+    return packRGB(r, g, b);
   }
 
-  /** HSV→RGB packed color (hue 0-255). */
-  static uint32_t hsvColor(uint8_t hue, uint8_t sat = 255, uint8_t val = 255) {
-    CRGB c;
-    c.setHSV(hue, sat, val);
-    return packColor(c.r, c.g, c.b);
+  void resolveWordColor() {
+    resolvedWordColor = randomWordColor ? vibrantRandom()
+                                       : packRGB(wordR, wordG, wordB);
   }
 
-  // ── Current resolved colors ───────────────────────────────────────────────
-  uint32_t resolvedWordColor = 0;
-  uint32_t resolvedBgColor   = 0;
+  // ── Word mask helpers ─────────────────────────────────────────────────────
 
-  void resolveColors() {
-    resolvedWordColor = randomWordColor ? randomColor()
-                                       : packColor(wordR, wordG, wordB);
-    resolvedBgColor   = randomBgColor  ? randomColor()
-                                       : packColor(bgR, bgG, bgB);
+  void clearMask(bool* mask) {
+    memset(mask, 0, sizeof(bool) * TOTAL_LEDS);
   }
 
-  // ── Word illumination helpers ─────────────────────────────────────────────
-
-  void lightWord(const WordSegment& w, uint32_t color) {
-    for (int i = 0; i < w.len; i++) {
-      int idx = matrixLed(w.row, w.col + i);
-      if (idx >= 0 && idx < TOTAL_LEDS)
-        targetColors[idx] = scaleBrightness(color, wordBrightness);
+  void lightSeg(bool* mask, const WC_Seg& seg) {
+    for (int i = 0; i < seg.len; i++) {
+      int idx = matrixLed(seg.row, seg.col + i);
+      if (idx >= 0 && idx < TOTAL_LEDS) mask[idx] = true;
     }
   }
 
-  void clearTarget() {
-    uint32_t bg = scaleBrightness(resolvedBgColor, bgBrightness);
-    for (int i = 0; i < TOTAL_LEDS; i++) targetColors[i] = bg;
-    // Minute dots default off (set later)
-    for (int i = 0; i < MINUTE_LEDS; i++) targetColors[i] = 0;
-  }
-
-  // ── Time → word mapping ───────────────────────────────────────────────────
+  // ── Time → word mask conversion ───────────────────────────────────────────
 
   /**
-   * Populate targetColors[] for the given local hour (0-23) and minute (0-59).
-   * The 4 minute-dot LEDs (indices 0-3) show (minute % 5) extra minutes.
+   * Build a word pixel mask for the given hour (0-23) and minute (0-59).
+   * Also sets minuteDots for the sub-5-minute indicator LEDs.
    */
-  void buildTimeDisplay(int hour, int minute) {
-    clearTarget();
+  void buildWordMask(bool* mask, int hour, int minute) {
+    clearMask(mask);
 
-    int extraMins = minute % 5;
-    int block     = minute / 5;   // 0-11
+    int block  = minute / 5;    // 0-11 (which 5-minute interval)
+    minuteDots = minute % 5;    // 0-4 (extra minutes shown as dots)
 
-    // ── Minute indicator dots ────────────────────────────────────────────
-    uint32_t dotColor = scaleBrightness(resolvedWordColor, wordBrightness);
-    for (int i = 0; i < MINUTE_LEDS; i++) {
-      targetColors[i] = (i < extraMins) ? dotColor : 0;
-    }
+    // Convert to 12-hour and advance hour for "TO" phrases (blocks 7-11)
+    int h12 = hour % 12;
+    if (h12 == 0) h12 = 12;
+    if (block >= 7) h12 = (h12 % 12) + 1;  // next hour for "X to HOUR"
 
-    // ── "IT IS" always on ─────────────────────────────────────────────
-    lightWord(WC_IT, resolvedWordColor);
-    lightWord(WC_IS, resolvedWordColor);
+    // "IT IS" always lit
+    lightSeg(mask, WC_IT);
+    lightSeg(mask, WC_IS);
 
-    // ── Adjust hour for "TO" phrases ────────────────────────────────────
-    int displayHour = hour % 12;
-    if (block >= 7) displayHour = (displayHour + 1) % 12; // next hour for "TO"
-
-    // ── Minute words ─────────────────────────────────────────────────────
-    switch (block) {
-      case  0:                                               // O'CLOCK
-        lightWord(WC_OCLOCK, resolvedWordColor); break;
-      case  1:                                               // FIVE PAST
-        lightWord(WC_FIVE_MIN, resolvedWordColor);
-        lightWord(WC_PAST, resolvedWordColor); break;
-      case  2:                                               // TEN PAST
-        lightWord(WC_TEN_MIN, resolvedWordColor);
-        lightWord(WC_PAST, resolvedWordColor); break;
-      case  3:                                               // QUARTER PAST
-        lightWord(WC_QUARTER, resolvedWordColor);
-        lightWord(WC_PAST, resolvedWordColor); break;
-      case  4:                                               // TWENTY PAST
-        lightWord(WC_TWENTY, resolvedWordColor);
-        lightWord(WC_PAST, resolvedWordColor); break;
-      case  5:                                               // TWENTY FIVE PAST
-        lightWord(WC_TWENTY, resolvedWordColor);
-        lightWord(WC_FIVE_MIN, resolvedWordColor);
-        lightWord(WC_PAST, resolvedWordColor); break;
-      case  6:                                               // HALF PAST
-        lightWord(WC_HALF, resolvedWordColor);
-        lightWord(WC_PAST, resolvedWordColor); break;
-      case  7:                                               // TWENTY FIVE TO
-        lightWord(WC_TWENTY, resolvedWordColor);
-        lightWord(WC_FIVE_MIN, resolvedWordColor);
-        lightWord(WC_TO, resolvedWordColor); break;
-      case  8:                                               // TWENTY TO
-        lightWord(WC_TWENTY, resolvedWordColor);
-        lightWord(WC_TO, resolvedWordColor); break;
-      case  9:                                               // QUARTER TO
-        lightWord(WC_QUARTER, resolvedWordColor);
-        lightWord(WC_TO, resolvedWordColor); break;
-      case 10:                                               // TEN TO
-        lightWord(WC_TEN_MIN, resolvedWordColor);
-        lightWord(WC_TO, resolvedWordColor); break;
-      case 11:                                               // FIVE TO
-        lightWord(WC_FIVE_MIN, resolvedWordColor);
-        lightWord(WC_TO, resolvedWordColor); break;
-    }
-
-    // ── Hour words ────────────────────────────────────────────────────────
-    const WordSegment* hourWord = nullptr;
-    switch (displayHour) {
-      case  0: case 12: hourWord = &WC_TWELVE; break;
-      case  1:          hourWord = &WC_ONE;    break;
-      case  2:          hourWord = &WC_TWO;    break;
-      case  3:          hourWord = &WC_THREE;  break;
-      case  4:          hourWord = &WC_FOUR;   break;
-      case  5:          hourWord = &WC_FIVE_HR;break;
-      case  6:          hourWord = &WC_SIX;    break;
-      case  7:          hourWord = &WC_SEVEN;  break;
-      case  8:          hourWord = &WC_EIGHT;  break;
-      case  9:          hourWord = &WC_NINE;   break;
-      case 10:          hourWord = &WC_TEN_HR; break;
-      case 11:          hourWord = &WC_ELEVEN; break;
-    }
-    if (hourWord) lightWord(*hourWord, resolvedWordColor);
-
-    // ── AM / PM indicator ─────────────────────────────────────────────────
+    // AM / PM indicator
     if (showAmPm) {
-      bool isPm = (hour >= 12);
-      lightWord(isPm ? WC_PM : WC_AM, resolvedWordColor);
+      lightSeg(mask, hour < 12 ? WC_AM : WC_PM);
     }
-  }
 
-  // ── Transition rendering ──────────────────────────────────────────────────
-
-  /**
-   * Render transition frame at progress [0.0 .. 1.0].
-   * At progress == 1.0 we snap to targetColors[].
-   */
-  void renderTransitionFrame(float progress) {
-    switch (activeTransMode) {
-      case TRANS_RAINBOW_WAVE:  renderRainbowWave(progress);  break;
-      case TRANS_RADIAL_BLOOM:  renderRadialBloom(progress);  break;
-      case TRANS_CORNER_WIPE:   renderCornerWipe(progress);   break;
-      default:                  renderRainbowWave(progress);  break;
+    // Minute phrase
+    switch (block) {
+      case  0:                                                           break;
+      case  1: lightSeg(mask, WC_FIVE_MIN);                             break;
+      case  2: lightSeg(mask, WC_TEN_MIN);                              break;
+      case  3: lightSeg(mask, WC_QUARTER);                              break;
+      case  4: lightSeg(mask, WC_TWENTY);                               break;
+      case  5: lightSeg(mask, WC_TWENTY); lightSeg(mask, WC_FIVE_MIN); break;
+      case  6: lightSeg(mask, WC_HALF);                                 break;
+      case  7: lightSeg(mask, WC_TWENTY); lightSeg(mask, WC_FIVE_MIN); break;
+      case  8: lightSeg(mask, WC_TWENTY);                               break;
+      case  9: lightSeg(mask, WC_QUARTER);                              break;
+      case 10: lightSeg(mask, WC_TEN_MIN);                              break;
+      case 11: lightSeg(mask, WC_FIVE_MIN);                             break;
     }
-  }
 
-  /** Sweeping rainbow band that crosses the matrix then resolves to target. */
-  void renderRainbowWave(float progress) {
-    float waveFront = progress * (COLS + ROWS); // 0 → COLS+ROWS
-    for (int row = 0; row < ROWS; row++) {
-      for (int col = 0; col < COLS; col++) {
-        int   idx    = matrixLed(row, col);
-        float dist   = (float)(col + row); // diagonal distance
-        float behind = waveFront - dist;
-        uint32_t c;
-        if (behind < 0.0f) {
-          // Wave hasn't arrived → old background colour
-          c = scaleBrightness(resolvedBgColor, bgBrightness);
-        } else if (behind < 2.0f) {
-          // In the wave band → rainbow
-          uint8_t hue = (uint8_t)(dist * 255 / (COLS + ROWS));
-          c = hsvColor(hue, 255, 255);
-        } else {
-          // Wave has passed → snap to target
-          c = targetColors[idx];
-        }
-        setLed(idx, c);
-      }
+    // PAST / TO connective
+    if (block >= 1 && block <= 6) lightSeg(mask, WC_PAST);
+    if (block >= 7)                lightSeg(mask, WC_TO);
+
+    // Hour word
+    switch (h12) {
+      case  1: lightSeg(mask, WC_ONE);    break;
+      case  2: lightSeg(mask, WC_TWO);    break;
+      case  3: lightSeg(mask, WC_THREE);  break;
+      case  4: lightSeg(mask, WC_FOUR);   break;
+      case  5: lightSeg(mask, WC_FIVE_HR);break;
+      case  6: lightSeg(mask, WC_SIX);    break;
+      case  7: lightSeg(mask, WC_SEVEN);  break;
+      case  8: lightSeg(mask, WC_EIGHT);  break;
+      case  9: lightSeg(mask, WC_NINE);   break;
+      case 10: lightSeg(mask, WC_TEN_HR); break;
+      case 11: lightSeg(mask, WC_ELEVEN); break;
+      case 12: lightSeg(mask, WC_TWELVE); break;
     }
-    // Minute dots snap immediately
-    for (int i = 0; i < MINUTE_LEDS; i++) setLed(i, targetColors[i]);
-  }
 
-  /** Radial bloom expanding from the matrix centre. */
-  void renderRadialBloom(float progress) {
-    float cx     = (COLS - 1) / 2.0f;
-    float cy     = (ROWS - 1) / 2.0f;
-    float maxR   = sqrtf(cx * cx + cy * cy);
-    float radius = progress * (maxR + 1.0f);
-    uint8_t hueOffset = (uint8_t)(progress * 128);
-
-    for (int row = 0; row < ROWS; row++) {
-      for (int col = 0; col < COLS; col++) {
-        int   idx = matrixLed(row, col);
-        float dx  = col - cx, dy = row - cy;
-        float d   = sqrtf(dx * dx + dy * dy);
-        uint32_t c;
-        if (d > radius) {
-          c = scaleBrightness(resolvedBgColor, bgBrightness);
-        } else if (d > radius - 1.5f) {
-          uint8_t hue = (uint8_t)(d / maxR * 255) + hueOffset;
-          c = hsvColor(hue, 255, 255);
-        } else {
-          c = targetColors[idx];
-        }
-        setLed(idx, c);
-      }
-    }
-    for (int i = 0; i < MINUTE_LEDS; i++) setLed(i, targetColors[i]);
-  }
-
-  /** Diagonal corner wipe from top-left to bottom-right. */
-  void renderCornerWipe(float progress) {
-    float totalDiag = (float)(COLS + ROWS - 2);
-    float front     = progress * (totalDiag + 2.0f);
-    for (int row = 0; row < ROWS; row++) {
-      for (int col = 0; col < COLS; col++) {
-        int   idx  = matrixLed(row, col);
-        float diag = (float)(row + col);
-        uint32_t c;
-        if (diag > front) {
-          c = scaleBrightness(resolvedBgColor, bgBrightness);
-        } else if (diag > front - 1.5f) {
-          uint8_t hue = (uint8_t)(diag / totalDiag * 255);
-          c = hsvColor(hue, 255, 255);
-        } else {
-          c = targetColors[idx];
-        }
-        setLed(idx, c);
-      }
-    }
-    for (int i = 0; i < MINUTE_LEDS; i++) setLed(i, targetColors[i]);
-  }
-
-  // ── Direct LED write helper ───────────────────────────────────────────────
-  void setLed(int idx, uint32_t color) {
-    if (idx < 0 || idx >= (int)strip.getLengthTotal()) return;
-    uint8_t r = (color >> 16) & 0xFF;
-    uint8_t g = (color >>  8) & 0xFF;
-    uint8_t b = (color      ) & 0xFF;
-    uint8_t w = (color >> 24) & 0xFF;
-    strip.setPixelColor(idx, r, g, b, w);
-  }
-
-  void applyTargetColors() {
-    for (int i = 0; i < TOTAL_LEDS && i < (int)strip.getLengthTotal(); i++) {
-      setLed(i, targetColors[i]);
-    }
+    // O'CLOCK on the hour
+    if (block == 0) lightSeg(mask, WC_OCLOCK);
   }
 
   // ── Time acquisition ──────────────────────────────────────────────────────
+
   /**
    * Populate t with the current local time.
-   * Returns false if NTP has not yet synchronised.
-   * Named wcGetLocalTime to avoid clashing with the ESP32 SDK's
-   * built-in getLocalTime() function.
+   * Returns false if WLED is not connected or NTP not yet synced.
+   * Named wcGetLocalTime to avoid colliding with the ESP32 SDK function.
    */
   bool wcGetLocalTime(struct tm& t) {
     if (!WLED_CONNECTED) return false;
-    updateLocalTime();                   // WLED built-in: refreshes localTime
-    if (localTime == 0) return false;    // not yet synced
+    updateLocalTime();              // WLED built-in: refreshes the localTime global
+    if (localTime == 0) return false;
     struct tm tmp;
     localtime_r(&localTime, &tmp);
     t = tmp;
     return true;
   }
 
-  // ── Trigger a new transition ──────────────────────────────────────────────
-  void triggerTransition() {
-    transitionActive = true;
-    transitionStart  = millis();
-    uint8_t mode     = transitionMode;
-    if (mode == TRANS_RANDOM) mode = (uint8_t)(random8() % 3);
-    activeTransMode  = mode;
-  }
-
 public:
-  // ── Usermod lifecycle ─────────────────────────────────────────────────────
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+
   void setup() override {
-    resolveColors();
-    clearTarget();
+    clearMask(wordPixels);
+    clearMask(prevWordPixels);
+    resolveWordColor();
   }
 
+  /**
+   * loop() only updates the word mask and triggers fades on minute change.
+   * It does NOT write any pixels — that happens in handleOverlayDraw().
+   */
   void loop() override {
-    if (!enabled || strip.isUpdating()) return;
+    if (!enabled) return;
 
     struct tm t;
-    if (!wcGetLocalTime(t)) return;    // wait for NTP sync
+    if (!wcGetLocalTime(t)) return;  // wait for NTP sync
 
     int currentMinute = t.tm_min;
     int currentHour   = t.tm_hour;
 
-    // ── First run after NTP sync: show current time immediately, no transition
-    if (firstRun) {
-      firstRun  = false;
-      lastMinute = currentMinute;
-      resolveColors();
-      buildTimeDisplay(currentHour, currentMinute);
-      applyTargetColors();
-      strip.trigger();
-      return;
-    }
+    if (firstRun || currentMinute != lastMinute) {
+      // Save the current mask so we can crossfade from it
+      memcpy(prevWordPixels, wordPixels, sizeof(wordPixels));
 
-    // ── Minute rollover: rebuild display and start transition
-    if (currentMinute != lastMinute) {
+      // Build the new mask
+      resolveWordColor();
+      buildWordMask(wordPixels, currentHour, currentMinute);
       lastMinute = currentMinute;
-      resolveColors();               // re-randomise colours if random mode is on
-      buildTimeDisplay(currentHour, currentMinute);
-      triggerTransition();
-    }
 
-    // ── Animate transition or hold steady
-    if (transitionActive) {
-      uint32_t elapsed = millis() - transitionStart;
-      if (elapsed >= transitionMs) {
-        transitionActive = false;
-        applyTargetColors();
+      if (firstRun) {
+        // Snap to current time immediately — no fade on startup
+        firstRun  = false;
+        fadingIn  = false;
+        memcpy(prevWordPixels, wordPixels, sizeof(wordPixels));
       } else {
-        float progress = (float)elapsed / (float)transitionMs;
-        renderTransitionFrame(progress);
+        fadingIn  = true;
+        fadeStart = millis();
       }
-    } else {
-      applyTargetColors();
     }
-
-    // Request WLED to push the updated pixel buffer to the LEDs.
-    // strip.trigger() is the correct usermod API — it sets a flag
-    // for WLED's main loop to call show() at the right time.
-    strip.trigger();
   }
 
-  // ── JSON state (read/write from HA or WLED app) ───────────────────────────
+  /**
+   * handleOverlayDraw() — called by WLED after the current effect has rendered
+   * its frame into the strip buffer, and before show() sends it to the LEDs.
+   *
+   * At this point strip.getPixelColor(i) returns the effect's rendered color
+   * for LED i.  We apply two operations:
+   *
+   *   Background pixels : dim the effect color by bgBrightness
+   *   Word pixels       : replace with solid wordColor (crossfading in/out)
+   */
+  void handleOverlayDraw() override {
+    if (!enabled) return;
+
+    // ── Compute crossfade alpha ────────────────────────────────────────────
+    // alpha = 0   → showing prevWordPixels fully
+    // alpha = 255 → showing wordPixels fully
+    uint8_t alpha = 255;
+    if (fadingIn) {
+      uint32_t elapsed = millis() - fadeStart;
+      if (elapsed >= (uint32_t)transitionMs) {
+        fadingIn = false;
+        // Sync prev mask so next fade starts from the correct state
+        memcpy(prevWordPixels, wordPixels, sizeof(wordPixels));
+        alpha = 255;
+      } else {
+        alpha = (uint8_t)((uint32_t)elapsed * 255 / transitionMs);
+      }
+    }
+
+    // ── Matrix pixels (LEDs 4-113) ────────────────────────────────────────
+    for (int i = MINUTE_LEDS; i < TOTAL_LEDS; i++) {
+      bool isWord  = wordPixels[i];
+      bool wasWord = prevWordPixels[i];
+
+      if (!isWord && !wasWord) {
+        // ── Pure background pixel ──────────────────────────────────────
+        // Dim whatever the effect rendered; if bgBrightness==255 do nothing
+        if (bgBrightness < 255) {
+          strip.setPixelColor(i, scaleBri(strip.getPixelColor(i), bgBrightness));
+        }
+      } else {
+        // ── This pixel is a word pixel in the current or previous display
+        // Compute effective word brightness for this pixel
+        uint8_t wordBri;
+        if (isWord && wasWord) {
+          // Stable word (present in both): keep at full word brightness
+          wordBri = wordBrightness;
+        } else if (isWord) {
+          // New word: fade in  0 → wordBrightness
+          wordBri = (uint8_t)((uint32_t)wordBrightness * alpha / 255);
+        } else {
+          // Old word: fade out  wordBrightness → 0
+          wordBri = (uint8_t)((uint32_t)wordBrightness * (255 - alpha) / 255);
+        }
+
+        if (wordBri > 0) {
+          // Word is visible: paint solid word color at computed brightness
+          strip.setPixelColor(i, scaleBri(resolvedWordColor, wordBri));
+        } else {
+          // Word has completely faded — treat as background
+          if (bgBrightness < 255) {
+            strip.setPixelColor(i, scaleBri(strip.getPixelColor(i), bgBrightness));
+          }
+        }
+      }
+    }
+
+    // ── Minute indicator dots (LEDs 0-3) ──────────────────────────────────
+    uint32_t dotColor = scaleBri(resolvedWordColor, wordBrightness);
+    for (int i = 0; i < MINUTE_LEDS; i++) {
+      if (i < minuteDots) {
+        // Lit dot: solid word color
+        strip.setPixelColor(i, dotColor);
+      } else {
+        // Unlit dot: background effect, dimmed
+        if (bgBrightness < 255) {
+          strip.setPixelColor(i, scaleBri(strip.getPixelColor(i), bgBrightness));
+        }
+      }
+    }
+  }
+
+  // ── JSON state API (read/write from WLED app or Home Assistant) ───────────
+
   void addToJsonState(JsonObject& root) override {
     JsonObject obj = root.createNestedObject(FPSTR(_name));
-    obj[F("on")]           = enabled;
-    obj[F("wordBri")]      = wordBrightness;
-    obj[F("bgBri")]        = bgBrightness;
-    obj[F("ampm")]         = showAmPm;
-    obj[F("randWord")]     = randomWordColor;
-    obj[F("randBg")]       = randomBgColor;
-    obj[F("tranMode")]     = transitionMode;
-    obj[F("tranMs")]       = transitionMs;
-    // Colours as hex strings for easy HA color_picker integration
+    obj[F("on")]        = enabled;
+    obj[F("wordBri")]   = wordBrightness;
+    obj[F("bgBri")]     = bgBrightness;
+    obj[F("ampm")]      = showAmPm;
+    obj[F("randWord")]  = randomWordColor;
+    obj[F("tranMs")]    = transitionMs;
     char buf[8];
     snprintf(buf, sizeof(buf), "#%02X%02X%02X", wordR, wordG, wordB);
-    obj[F("wordColor")]    = buf;
-    snprintf(buf, sizeof(buf), "#%02X%02X%02X", bgR, bgG, bgB);
-    obj[F("bgColor")]      = buf;
+    obj[F("wordColor")] = buf;
   }
 
   void readFromJsonState(JsonObject& root) override {
@@ -496,55 +410,34 @@ public:
     getJsonValue(obj[F("bgBri")],    bgBrightness);
     getJsonValue(obj[F("ampm")],     showAmPm);
     getJsonValue(obj[F("randWord")], randomWordColor);
-    getJsonValue(obj[F("randBg")],   randomBgColor);
-    getJsonValue(obj[F("tranMode")], transitionMode);
     getJsonValue(obj[F("tranMs")],   transitionMs);
-
-    // Parse hex color strings
     if (obj[F("wordColor")].is<const char*>()) {
       const char* hex = obj[F("wordColor")];
       if (hex[0] == '#' && strlen(hex) == 7) {
-        wordR = (uint8_t)strtol(hex + 1, nullptr, 16) >> 16;
-        wordG = ((uint8_t)strtol(hex + 1, nullptr, 16) >> 8) & 0xFF;
-        wordB = ((uint8_t)strtol(hex + 1, nullptr, 16)) & 0xFF;
-        // Re-parse properly
         uint32_t rgb = strtol(hex + 1, nullptr, 16);
         wordR = (rgb >> 16) & 0xFF;
         wordG = (rgb >>  8) & 0xFF;
         wordB =  rgb        & 0xFF;
       }
     }
-    if (obj[F("bgColor")].is<const char*>()) {
-      const char* hex = obj[F("bgColor")];
-      if (hex[0] == '#' && strlen(hex) == 7) {
-        uint32_t rgb = strtol(hex + 1, nullptr, 16);
-        bgR = (rgb >> 16) & 0xFF;
-        bgG = (rgb >>  8) & 0xFF;
-        bgB =  rgb        & 0xFF;
-      }
-    }
-
-    // Force redraw immediately
+    // Force redraw on next loop() tick
     lastMinute = 255;
+    firstRun   = true;
   }
 
-  // ── Persistent config ─────────────────────────────────────────────────────
+  // ── Persistent config (saved to flash) ───────────────────────────────────
+
   void addToConfig(JsonObject& root) override {
     JsonObject obj = root.createNestedObject(FPSTR(_name));
-    obj[F("enabled")]      = enabled;
-    obj[F("wordBri")]      = wordBrightness;
-    obj[F("bgBri")]        = bgBrightness;
-    obj[F("ampm")]         = showAmPm;
-    obj[F("randWord")]     = randomWordColor;
-    obj[F("randBg")]       = randomBgColor;
-    obj[F("tranMode")]     = transitionMode;
-    obj[F("tranMs")]       = transitionMs;
-    obj[F("wordR")]        = wordR;
-    obj[F("wordG")]        = wordG;
-    obj[F("wordB")]        = wordB;
-    obj[F("bgR")]          = bgR;
-    obj[F("bgG")]          = bgG;
-    obj[F("bgB")]          = bgB;
+    obj[F("enabled")]   = enabled;
+    obj[F("wordBri")]   = wordBrightness;
+    obj[F("bgBri")]     = bgBrightness;
+    obj[F("ampm")]      = showAmPm;
+    obj[F("randWord")]  = randomWordColor;
+    obj[F("tranMs")]    = transitionMs;
+    obj[F("wordR")]     = wordR;
+    obj[F("wordG")]     = wordG;
+    obj[F("wordB")]     = wordB;
   }
 
   bool readFromConfig(JsonObject& root) override {
@@ -556,25 +449,19 @@ public:
     changed |= getJsonValue(obj[F("bgBri")],     bgBrightness);
     changed |= getJsonValue(obj[F("ampm")],      showAmPm);
     changed |= getJsonValue(obj[F("randWord")],  randomWordColor);
-    changed |= getJsonValue(obj[F("randBg")],    randomBgColor);
-    changed |= getJsonValue(obj[F("tranMode")],  transitionMode);
     changed |= getJsonValue(obj[F("tranMs")],    transitionMs);
     changed |= getJsonValue(obj[F("wordR")],     wordR);
     changed |= getJsonValue(obj[F("wordG")],     wordG);
     changed |= getJsonValue(obj[F("wordB")],     wordB);
-    changed |= getJsonValue(obj[F("bgR")],       bgR);
-    changed |= getJsonValue(obj[F("bgG")],       bgG);
-    changed |= getJsonValue(obj[F("bgB")],       bgB);
     return changed;
   }
 
-  // ── WLED UI config page ───────────────────────────────────────────────────
+  // ── WLED config page hints ────────────────────────────────────────────────
+
   void appendConfigData() override {
-    // Generates HTML input elements in the WLED config UI
-    oappend(SET_F("addInfo('wc:wordBri',1,'Word LED brightness (0-255)');"));
-    oappend(SET_F("addInfo('wc:bgBri',1,'Background LED brightness (0-255)');"));
-    oappend(SET_F("addInfo('wc:tranMode',1,'0=Rainbow Wave  1=Radial Bloom  2=Corner Wipe  3=Random');"));
-    oappend(SET_F("addInfo('wc:tranMs',1,'Transition duration in milliseconds');"));
+    oappend(SET_F("addInfo('wc:wordBri',1,'Word LED brightness 0-255');"));
+    oappend(SET_F("addInfo('wc:bgBri',1,'Effect behind words: 0=black 128=half 255=unchanged');"));
+    oappend(SET_F("addInfo('wc:tranMs',1,'Crossfade duration on minute change (ms)');"));
   }
 
   uint16_t getId() override { return USERMOD_ID_WORDCLOCK; }
