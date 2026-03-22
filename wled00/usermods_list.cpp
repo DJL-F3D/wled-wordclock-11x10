@@ -1,16 +1,22 @@
-/*
- * This file registers all enabled usermods.
- * Copy this file into wled00/ in the WLED source tree,
- * or add the relevant lines to your existing usermods_list.cpp.
- *
- * IMPORTANT: USERMOD_ID_WORDCLOCK must be defined in const.h (or add it yourself):
- *   #define USERMOD_ID_WORDCLOCK  99   // pick an unused ID
- */
+// usermods_list.cpp — registers whichever word clock usermod is being built.
+// The correct define is set by the PlatformIO environment in
+// platformio_override.ini.  Only one is compiled per build.
 
-// ── WordClock usermod ────────────────────────────────────────────────────────
-#include "../usermods/WordClock/wordclock_usermod.h"
+#ifdef USERMOD_ID_WORDCLOCK
+  #include "../usermods/WordClock/wordclock_usermod.h"
+#endif
+
+#ifdef USERMOD_ID_WORDCLOCK_8X8
+  #include "../usermods/WordClock8x8/wordclock_8x8_usermod.h"
+#endif
 
 void registerUsermods()
 {
-  usermods.add(new WordClockUsermod());
+  #ifdef USERMOD_ID_WORDCLOCK
+    UsermodManager::add(new WordClockUsermod());
+  #endif
+
+  #ifdef USERMOD_ID_WORDCLOCK_8X8
+    UsermodManager::add(new WordClock8x8Usermod());
+  #endif
 }

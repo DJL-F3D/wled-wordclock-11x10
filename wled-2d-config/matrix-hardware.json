@@ -1,0 +1,20 @@
+{
+  "hw": {
+    "led": {
+      "matrix": {
+        "mpc": 1,
+        "panels": [
+          {
+            "b": false,
+            "r": false,
+            "v": false,
+            "w": 11,
+            "h": 10,
+            "x": 0,
+            "y": 0
+          }
+        ]
+      }
+    }
+  }
+}

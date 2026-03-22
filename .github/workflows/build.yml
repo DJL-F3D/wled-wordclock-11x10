@@ -1,6 +1,6 @@
 # ============================================================
 # .github/workflows/build.yml
-# Builds WLED Word Clock firmware for ESP32-C3 and ESP8266.
+# Builds WLED Word Clock firmware for all four environments.
 #
 # How it works:
 #   1. Clones WLED from github.com/wled/WLED at a pinned tag
@@ -8,8 +8,8 @@
 #   3. Applies platformio_override.ini to add our build envs
 #   4. Compiles using WLED's own PlatformIO setup
 #
-# Tag MUST include the "v" prefix — e.g. "v0.15.3".
-# The repo is wled/WLED (moved from Aircoookie/WLED in 2024).
+# WLED_TAG must include the "v" prefix — e.g. "v0.15.3"
+# The repo moved from Aircoookie/WLED to wled/WLED in 2024.
 # ============================================================
 name: Build Firmware
 
@@ -48,6 +48,10 @@ jobs:
             artifact: wordclock-esp32c3
           - env: wordclock_esp8266
             artifact: wordclock-esp8266
+          - env: wordclock8x8_esp32c3
+            artifact: wordclock8x8-esp32c3
+          - env: wordclock8x8_esp8266
+            artifact: wordclock8x8-esp8266
 
     steps:
       - name: Checkout Word Clock repository
@@ -62,22 +66,21 @@ jobs:
             "https://github.com/${{ env.WLED_REPO }}.git" \
             wled-src
           echo "Cloned ${{ env.WLED_REPO }} at ${{ env.WLED_TAG }}"
-          ls wled-src/
 
-      - name: Inject Word Clock usermod into WLED source
+      - name: Inject Word Clock files into WLED source
         run: |
-          cp -r usermods/WordClock    wled-src/usermods/
-          cp wled00/usermods_list.cpp wled-src/wled00/usermods_list.cpp
-          printf '\n// Word Clock usermod\n#ifndef USERMOD_ID_WORDCLOCK\n#define USERMOD_ID_WORDCLOCK 99\n#endif\n' \
-            >> wled-src/wled00/const.h
-          echo "Injected files:"
-          ls wled-src/usermods/WordClock/
-          tail -5 wled-src/wled00/const.h
+          cp -r usermods/WordClock     wled-src/usermods/
+          cp -r usermods/WordClock8x8  wled-src/usermods/
+          cp wled00/usermods_list.cpp  wled-src/wled00/usermods_list.cpp
+          printf '\n// Word Clock usermods\n'                         >> wled-src/wled00/const.h
+          printf '#ifndef USERMOD_ID_WORDCLOCK\n'                     >> wled-src/wled00/const.h
+          printf '#define USERMOD_ID_WORDCLOCK 99\n#endif\n'          >> wled-src/wled00/const.h
+          printf '#ifndef USERMOD_ID_WORDCLOCK_8X8\n'                 >> wled-src/wled00/const.h
+          printf '#define USERMOD_ID_WORDCLOCK_8X8 98\n#endif\n'      >> wled-src/wled00/const.h
+          echo "Injected. Tail of const.h:"; tail -7 wled-src/wled00/const.h
 
       - name: Copy platformio_override.ini into WLED root
-        run: |
-          cp platformio_override.ini wled-src/platformio_override.ini
-          cat wled-src/platformio_override.ini
+        run: cp platformio_override.ini wled-src/platformio_override.ini
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -102,15 +105,13 @@ jobs:
         working-directory: wled-src
         run: pio run --environment "${{ matrix.env }}"
 
-      - name: Find compiled .bin file
+      - name: Find compiled .bin
         id: find_bin
         working-directory: wled-src
         run: |
           BIN=$(find .pio/build/${{ matrix.env }} -maxdepth 1 -name "*.bin" | head -1)
           if [ -z "$BIN" ]; then
-            echo "ERROR: no .bin found in .pio/build/${{ matrix.env }}"
-            ls .pio/build/${{ matrix.env }}/ || true
-            exit 1
+            echo "ERROR: no .bin found"; ls .pio/build/${{ matrix.env }}/ || true; exit 1
           fi
           echo "bin_path=$BIN" >> "$GITHUB_OUTPUT"
           echo "Found: $BIN"
@@ -131,17 +132,11 @@ jobs:
       (github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true')
 
     steps:
-      - name: Download ESP32-C3 firmware
+      - name: Download all firmware artifacts
         uses: actions/download-artifact@v4
         with:
-          name: wordclock-esp32c3
           path: release/
-
-      - name: Download ESP8266 firmware
-        uses: actions/download-artifact@v4
-        with:
-          name: wordclock-esp8266
-          path: release/
+          merge-multiple: true
 
       - name: Get tag / version
         id: version
@@ -163,14 +158,17 @@ jobs:
             ## WLED Word Clock Firmware
             Built on WLED ${{ env.WLED_TAG }}
 
-            | File | Target board |
-            |------|-------------|
-            | `wordclock-esp32c3.bin` | ESP32-C3 (SuperMini, XIAO) |
-            | `wordclock-esp8266.bin` | ESP8266 (Wemos D1 Mini, NodeMCU v2) |
+            | File | Clock | Board |
+            |------|-------|-------|
+            | `wordclock-esp32c3.bin`    | 11×10 matrix | ESP32-C3 SuperMini |
+            | `wordclock-esp8266.bin`    | 11×10 matrix | ESP8266 D1 Mini    |
+            | `wordclock8x8-esp32c3.bin` |  8×8  matrix | ESP32-C3 SuperMini |
+            | `wordclock8x8-esp8266.bin` |  8×8  matrix | ESP8266 D1 Mini    |
 
             ### After flashing
             1. Connect to **WLED-AP** hotspot → enter your WiFi password
-            2. Open `http://wled.local` → **Config → LED Preferences** → LED count = **114**
+            2. Open `http://wled.local` → **Config → LED Preferences** → set LED count
+               - 11×10 clock: **114**  |  8×8 clock: **64**
             3. **Config → Time & Macros** → enable NTP, set your UTC offset
-            4. **Config → Usermods → wc** → configure word clock options
+            4. **Config → Usermods → wc** (11×10) or **wc8** (8×8) → configure colours
           files: release/*.bin
